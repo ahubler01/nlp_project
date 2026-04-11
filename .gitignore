@@ -214,3 +214,9 @@ data/Stock_news/All_external.parquet
 data/Stock_news/nasdaq_external_data.parquet
 data/Stock_news/subset_news.parquet
 data/Stock_price/stock_price.parquet
+
+# Mac noise
+.DS_Store
+
+# Trained checkpoints (too big for git; store externally)
+models/finbert_multitask/best.pt
