@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "finlens"
+version = "1.0.0"
+description = "FinLens — financial news intelligence dashboard"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi",
+  "uvicorn[standard]",
+  "polars",
+  "pyarrow",
+  "numpy",
+  "pandas",
+  "scipy",
+  "scikit-learn",
+  "xgboost",
+  "joblib",
+  "sentence-transformers",
+  "transformers",
+  "torch",
+  "bertopic",
+  "umap-learn",
+  "hdbscan",
+  "sumy",
+  "nltk",
+  "pydantic",
+]
+
+[tool.setuptools.packages.find]
+include = ["backend*"]
