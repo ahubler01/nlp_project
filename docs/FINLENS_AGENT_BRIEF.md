@@ -1,300 +1,284 @@
-# AGENT TASK — FinLens: Financial News Intelligence Dashboard
+# AGENT TASK — FinLens: Financial News Intelligence Dashboard (Student Project)
 
 ## Objective
 
-Build **FinLens**, a local production dashboard that surfaces the lifecycle, seasonality, and ticker impact of financial news topics. A working React/Recharts UI prototype exists (dark terminal aesthetic — IBM Plex Mono, Syne display, `#020817` background). Your job is to wire every already-trained model in [models/](../models/) into a FastAPI backend, replace all simulated data with live inference over [data/preprocessed/subset_news.parquet](../data/preprocessed/subset_news.parquet), and ship a self-contained local app.
+Build **FinLens**, a simple, clean local web app that lets a user **explore financial news topics one view at a time**. This is a student project — prioritise clarity and simplicity over feature density. No complex dashboards, no crammed terminal UI. One clean white-themed page, a sidebar to pick the view, and a single focused panel on the right.
 
-This project does **not** pull from any external dataset (no FNS-PID, no live feed). All corpus data is local and most inference artefacts are already precomputed — the backend's job is mostly to read, filter, aggregate, and serve, with a narrow live path for user-defined topics.
+Wire the **already-trained models** in [models/](../models/) into a FastAPI backend, read from [data/preprocessed/subset_news.parquet](../data/preprocessed/subset_news.parquet), and serve everything locally. No external datasets. No live feeds.
 
-Read [docs/INFERENCE.md](./INFERENCE.md) before starting — it spells out every loader and feature-construction detail.
+Read [docs/INFERENCE.md](./INFERENCE.md) before starting — it explains the loaders and feature construction.
 
 ---
 
-## Corpus & precomputed artefacts (authoritative paths)
+## Design principles (read first)
 
-All paths relative to repo root.
+1. **One thing at a time.** The user picks a view from a sidebar — they never see everything at once.
+2. **White, light theme.** Clean background (`#ffffff` / `#f7f7f8`), dark text (`#111827`), a single accent color (`#2563eb` blue). Use `Inter` or system-ui font. No fancy typography.
+3. **Simple components.** Prefer plain HTML + CSS and basic Recharts charts. No custom animations, no glassmorphism, no gradients.
+4. **Student-grade code.** Readable Python and React. Obvious variable names. No premature abstraction. Short functions. Comments only where a reader would be confused.
+5. **Fail loudly, not silently.** If an artefact is missing, show a clear error card in the UI rather than a half-loaded chart.
 
-| File | Content | Used for |
+---
+
+## The 4 views (and only these)
+
+The sidebar has exactly **four items**. Each maps to one page. Nothing else.
+
+### 1. Topic Explorer
+- User picks one topic from a dropdown (13 fixed zero-shot topics + any user-defined ones).
+- Shows:
+  - A single line chart: **weekly intensity over the last 24 weeks**.
+  - A phase badge (🌑 Dormant / 📈 Rising / 🔥 Peak / 📉 Fading).
+  - A short list of the **top 5 tickers** for that topic (ticker, article count, mean `proba_up`).
+- Clicking any week on the chart opens a small modal with up to 5 headlines from that week.
+
+### 2. Topic Graph (cointegration network)
+- A node-link graph where **nodes = topics** and **edges = cointegration** of their weekly intensity series.
+- Compute pairwise **Engle–Granger cointegration** (`statsmodels.tsa.stattools.coint`) on the 24-week intensity curves. Draw an edge when `p_value < 0.05`. Edge thickness inversely proportional to `p_value`.
+- Render with a lightweight force layout library (`react-force-graph-2d` or plain D3 if simpler). Node color = topic category. Hover = label + p-values of incident edges.
+- Precompute the adjacency matrix at startup and serve it as JSON — do **not** recompute per request.
+
+### 3. Chat with the corpus
+- A chat panel where the user enters a topic + time window (natural language, e.g. *"Summarise oil & gas news for March 2025"*) and gets back a summary.
+- Backend parses topic + date range, retrieves matching articles, and returns:
+  - A **concatenated extractive summary** built from the pre-computed `Lsa_summary` / `Textrank_summary` columns in `subset_news.parquet`. Concatenate the top-N article summaries (ranked by topic probability), then run **sumy LSA** once more over that concatenation to produce a final 5-sentence summary.
+  - Aggregate **FinBERT sentiment** (share of positive / neutral / negative) over the window.
+  - List of the 5 source articles (title, ticker, date, URL).
+- **No external LLM.** Only local models already in [models/](../models/) + the already-computed summary columns. Keep it simple: this is retrieval + extractive summarisation, not generative.
+
+### 4. Ticker Browser
+- User picks a ticker from the 63-ticker pool.
+- Shows:
+  - Daily close price chart (24 weeks) from [data/Stock_price/stock_price.parquet](../data/Stock_price/stock_price.parquet).
+  - Top 3 topics that mention this ticker.
+  - Last 5 articles for this ticker (title, date, sentiment chip, URL).
+
+That's it. If a feature doesn't fit in one of these four pages, it doesn't ship.
+
+---
+
+## Corpus & precomputed artefacts
+
+All paths are relative to repo root.
+
+| File | Content | Role |
 |---|---|---|
-| [data/preprocessed/subset_news.parquet](../data/preprocessed/subset_news.parquet) | Raw news, schema: `id: UInt32, Date: str, date_parsed: Date, Article_title, Stock_symbol, Url, Publisher, Author, Article, Lsa_summary, Luhn_summary, Textrank_summary, Lexrank_summary` | Source of truth. `Stock_symbol` is already populated per row — NER is only needed for articles the user ingests live. |
-| [data/preprocessed/article_embeddings.npy](../data/preprocessed/article_embeddings.npy) + [article_embedding_ids.parquet](../data/preprocessed/article_embedding_ids.parquet) | MiniLM (384-d) embeddings per article, aligned by `id` | Cosine search for user topics; memory-map at startup. |
-| [data/predictions/lsa_summaries.parquet](../data/predictions/lsa_summaries.parquet) | `id, lsa_summary` | Redundant with `subset_news.Lsa_summary`; keep it as the durable cache for newly-ingested articles. |
-| [data/predictions/full_df_topic_probabilities.parquet](../data/predictions/full_df_topic_probabilities.parquet) | `id, prob_<label_13>` float32 | 13-topic zero-shot probabilities, precomputed. |
-| [data/predictions/finbert_embeddings.parquet](../data/predictions/finbert_embeddings.parquet) | `id, sentiment, score, emb_0…emb_767` | FinBERT sentiment + 768-d CLS embeddings. |
-| [data/predictions/xgb_tb_predictions.parquet](../data/predictions/xgb_tb_predictions.parquet) | `id, ticker, date, proba_up, pred` | Triple-barrier direction signal per article. |
-| [data/Stock_price/stock_price.parquet](../data/Stock_price/stock_price.parquet) | Daily OHLCV per ticker | Market indicator features + price-chart overlay. |
+| [data/preprocessed/subset_news.parquet](../data/preprocessed/subset_news.parquet) | Raw news + summaries. Columns include `id, Date, date_parsed, Article_title, Stock_symbol, Url, Publisher, Article, Lsa_summary, Luhn_summary, Textrank_summary, Lexrank_summary` | Source of truth |
+| [data/preprocessed/article_embeddings.npy](../data/preprocessed/article_embeddings.npy) + [article_embedding_ids.parquet](../data/preprocessed/article_embedding_ids.parquet) | MiniLM 384-d article embeddings | User-topic cosine retrieval |
+| [data/predictions/full_df_topic_probabilities.parquet](../data/predictions/full_df_topic_probabilities.parquet) | 13-topic zero-shot probabilities | Topic intensity + ticker scoring |
+| [data/predictions/finbert_embeddings.parquet](../data/predictions/finbert_embeddings.parquet) | FinBERT sentiment + 768-d CLS | Sentiment chips + chatbot aggregation |
+| [data/predictions/xgb_tb_predictions.parquet](../data/predictions/xgb_tb_predictions.parquet) | `proba_up`, `pred` per (ticker, date) | Top-ticker scoring |
+| [data/Stock_price/stock_price.parquet](../data/Stock_price/stock_price.parquet) | Daily OHLCV | Price chart |
 
-**63-ticker universe** — the entire pipeline is scoped to the `POOL` defined in [notebook/03_NER.ipynb](../notebook/03_NER.ipynb). Do **not** try to handle arbitrary S&P 500 tickers; the NER model's `LabelEncoder` and XGBoost's `feat_cols` are both fixed to this universe.
+63-ticker universe = the `POOL` defined in [notebook/03_NER.ipynb](../notebook/03_NER.ipynb). Do not handle tickers outside this pool.
 
 ---
 
-## Models to integrate (already trained — load, don't retrain)
+## Models (load — don't retrain)
 
-### 1. MiniLM embedder — [models/all-MiniLM-L6-v2/](../models/all-MiniLM-L6-v2/)
-Used for (a) the zero-shot topic classifier and (b) article/query cosine retrieval. Load once:
+| Model | Path | Used where |
+|---|---|---|
+| MiniLM embedder | [models/all-MiniLM-L6-v2/](../models/all-MiniLM-L6-v2/) | User topic queries |
+| Zero-shot classifier (inline class) | see [INFERENCE.md §3](./INFERENCE.md) | Only for user-defined topics |
+| BERTopic | [models/bertopic_news/](../models/bertopic_news/) | Optional: keyword enrichment only |
+| NER TF-IDF bundle | [models/ticker_ner_tfidf_2.joblib](../models/ticker_ner_tfidf_2.joblib) | Only if you add live article ingestion (out of scope for v1) |
+| FinBERT | [models/finbert_model/](../models/finbert_model/) + tokenizer + sentiment pipeline | Sentiment aggregation in chat view |
+| XGBoost direction signal | [models/xgb_tb/](../models/xgb_tb/) + prebaked predictions | Ticker ranking |
+
+Lazy-load heavy models on first request. Load precomputed parquets at startup. Memory-map `article_embeddings.npy`.
+
+---
+
+## Backend — FastAPI on `:8000`
+
+Keep the API small. Eight endpoints total.
+
+```
+GET  /health                         → { status, artefacts_present: {...} }
+
+GET  /topics                         → list of fixed + user topics
+POST /topics   { "label": "..." }    → embed with MiniLM, save to topics.db, return topic
+DELETE /topics/{id}                  → only for user topics
+
+GET  /timeline?topic_id=...          → 24-week intensity + phase + top-5 tickers (Topic Explorer)
+
+GET  /graph                          → { nodes:[{id,label}], edges:[{source,target,weight,pvalue}] }
+                                       Precomputed cointegration adjacency (Topic Graph view)
+
+POST /chat    { "query": "..." }     → { summary, sentiment:{pos,neu,neg}, articles:[...] }
+                                       Parses topic + date window, retrieves, summarises via sumy LSA
+
+GET  /ticker?symbol=AAPL             → { prices:[...], top_topics:[...], recent_articles:[...] }
+                                       Ticker Browser view
+```
+
+CORS: allow `http://localhost:3000`. Dates are ISO strings. Keep response shapes small and obvious.
+
+### Cointegration graph (precompute at startup)
+
 ```python
-from sentence_transformers import SentenceTransformer
-embed_model = SentenceTransformer("models/all-MiniLM-L6-v2", device="cpu")
+from statsmodels.tsa.stattools import coint
+
+def build_topic_graph(weekly_intensity: dict[str, np.ndarray]) -> dict:
+    topics = list(weekly_intensity)
+    edges = []
+    for i, a in enumerate(topics):
+        for b in topics[i+1:]:
+            _, pvalue, _ = coint(weekly_intensity[a], weekly_intensity[b])
+            if pvalue < 0.05:
+                edges.append({"source": a, "target": b,
+                              "pvalue": float(pvalue),
+                              "weight": float(1.0 - pvalue)})
+    nodes = [{"id": t, "label": t} for t in topics]
+    return {"nodes": nodes, "edges": edges}
 ```
 
-### 2. Zero-shot topic classifier (inline class, no separate artefact)
-Fixed 13-topic label set. The trained corpus-level probabilities already live in [full_df_topic_probabilities.parquet](../data/predictions/full_df_topic_probabilities.parquet); the class is only needed for **new** (user-ingested) articles or user-defined ad-hoc topic queries.
+### Chat endpoint (student-simple pipeline)
 
-Labels + descriptions + the `ZeroShotTopicClassifier` implementation are in [docs/INFERENCE.md §3](./INFERENCE.md). Document prefix at encode time: `"[<TICKER>] [<DATE>] <TITLE> | <LSA_SUMMARY>"`.
+1. Parse the query with a tiny regex / rule parser to extract (a) topic keywords and (b) a date range. If no date range is found, default to the last 4 weeks.
+2. Match the topic: cosine similarity between MiniLM-embedded query and the 13 fixed topic labels; pick the best match (threshold 0.35, else fall back to keyword overlap).
+3. Filter `subset_news` to `date_parsed` in range AND top-N articles by `prob_<topic>`.
+4. Concatenate their `Lsa_summary` fields, run sumy LSA on the concatenation → 5 sentences.
+5. Aggregate FinBERT sentiment counts over those articles.
+6. Return summary + sentiment + the 5 source articles.
 
-### 3. BERTopic — [models/bertopic_news/](../models/bertopic_news/)
-Already trained on the full corpus with the same 13 zero-shot anchors. Load via `BERTopic.load(..., embedding_model=embed_model)`. Use it for:
-- **Corpus-level cluster inspection** in an admin view (`get_topic_info()`).
-- Not the per-article scoring — `full_df_topic_probabilities.parquet` is canonical for that.
-
-**Do not** surface "auto-discovered clusters" as a separate UI concept. The corpus was trained with the 13 labels as zero-shot anchors, so residual HDBSCAN topics are small and noisy. If you want a "⚡ discovered" flavour, use the top-k BERTopic keywords for the same 13 labels (via `get_topic(topic_id)`) as label enrichment, not as new topics.
-
-### 4. NER ticker classifier — [models/ticker_ner_tfidf_2.joblib](../models/ticker_ner_tfidf_2.joblib)
-A `joblib` **dict** bundle: `{"vectorizer": HashingVectorizer, "clf": SGDClassifier, "le": LabelEncoder}`. Input = full article (title + body). Output = one ticker from the 63-ticker pool + softmax confidence. See [docs/INFERENCE.md §1](./INFERENCE.md).
-
-> Do **not** use rapidfuzz / alias tables / S&P 500 constituent lookups. Those approaches were benchmarked in [notebook/03_NER.ipynb](../notebook/03_NER.ipynb) and lost to the TF-IDF classifier — that is the single production path.
-
-### 5. FinBERT — [models/finbert_model/](../models/finbert_model/), [finbert_tokenizer/](../models/finbert_tokenizer/), [finbert_sentiment/](../models/finbert_sentiment/)
-`AutoModel` for 768-d CLS embeddings + HF `pipeline("text-classification")` for sentiment. Pre-applied; you only need this for live-ingested articles. See [docs/INFERENCE.md §4](./INFERENCE.md).
-
-### 6. XGBoost direction signal — [models/xgb_tb/](../models/xgb_tb/)
-Bundle: `xgb_tb.pkl`, `scaler.pkl`, `feat_cols.pkl`, `threshold.pkl`. Output: `proba_up` and binary `pred`. Prebaked predictions are in [xgb_tb_predictions.parquet](../data/predictions/xgb_tb_predictions.parquet) — serve from there.
-
-> ⚠️ The embedding PCA used to go from 768-d FinBERT to the `pc_0…pc_9` features is currently **not** persisted (notebook 09 refits it each run). For the backend, treat `xgb_tb_predictions.parquet` as the canonical signal and only recompute for articles *already present* in `finbert_embeddings.parquet`. If you need live XGBoost inference on brand-new articles, first persist `emb_pipeline.pkl` by re-running notebook 09's §"Train final XGBoost" cell with `joblib.dump(Pipeline([("sc", StandardScaler()), ("pca", PCA(10))]).fit(emb_mat), "models/xgb_tb/emb_pipeline.pkl")`.
-
----
-
-## Ingestion & caching strategy
-
-The backend serves a **closed corpus**: on startup, load precomputed artefacts into memory. Live inference is only needed when:
-1. The user **creates a new topic** → embed the query string with MiniLM, cosine-score against the cached `article_embeddings.npy`, aggregate weekly.
-2. The user **uploads / pastes a new article** (optional feature) → run the full pipeline (NER → LSA → zero-shot → FinBERT → append). This is out of scope for v1 unless explicitly prioritised.
-
-**Weekly aggregation**: use `date_parsed` (already a `Date` column — no parsing needed). The rolling window is the last 24 ISO weeks relative to `subset_news["date_parsed"].max()`. Precompute and cache the `(topic_id, iso_week) → intensity` grid at startup; it is ~13 topics × 24 weeks = 312 cells.
-
-**Per-ticker relevance**: join `subset_news` with `full_df_topic_probabilities` on `id`, group by `Stock_symbol`, take the weighted mean of `prob_<topic>` × (optionally `proba_up` from XGBoost for a "conviction-weighted" variant).
-
----
-
-## Backend — FastAPI
-
-Run on `:8000`. Lazy-load every heavy model (MiniLM, BERTopic, NER, FinBERT) on first request that needs it; article embeddings + parquet caches load at startup (memory-mapped for the `.npy`).
-
-### Endpoints
-
-```
-GET  /health                         → { status, models_loaded: { miniLM, bertopic, ner, finbert, xgb } }
-
-GET  /topics                         → { topics: [{ id, label, description, kind: "fixed"|"user", color }] }
-                                       Seeded with the 13 fixed zero-shot labels. User topics appended.
-POST /topics                         → body: { "label": "central bank liquidity" }
-                                       Backend embeds the label with MiniLM, stores in an in-process dict + SQLite
-                                       table (topics.db), returns the new topic with a generated id.
-DELETE /topics/{topic_id}            → 204. Cannot delete `kind: "fixed"`.
-
-GET  /timeline?topic_id=...&weeks=24 → [{ iso_week, week_start, intensity, article_count }]
-                                       For fixed topics: mean of prob_<label> per ISO week over last `weeks` weeks.
-                                       For user topics: mean cosine sim (clipped to [0,1]) between query embedding
-                                       and MiniLM article embeddings per ISO week.
-
-GET  /phase?topic_id=...             → { phase, label, emoji, pct_of_peak, momentum,
-                                         relative_magnitude, cycle: { peak_week_estimate, sigma, cycle_progress_pct } }
-
-GET  /stocks?topic_id=...&top_n=20   → [{ ticker, score, article_count, proba_up_mean, top_headlines:[{id,title,date,url}] }]
-                                       Articles filtered to the 24-week window; score = mean topic relevance × (1 + |mean proba_up - 0.5|).
-
-GET  /matrix?tickers=AAPL,JPM,NVDA   → { rows: tickers, cols: topic_ids, values: [[...]] }
-                                       mean topic relevance per (ticker, topic) over the 24-week window.
-
-GET  /articles?topic_id=...&iso_week=...&top_n=5
-                                     → [{ id, title, date, ticker, url, snippet, relevance, sentiment, proba_up }]
-                                       Drill-down source: for fixed topics rank by prob_<label>; for user topics rank
-                                       by cosine sim to query embedding.
-
-GET  /seasonality?topic_id=...       → [{ week_of_year, intensity, n_years }]
-                                       Aggregate intensity by ISO week-of-year across the whole corpus (not just 24w).
-
-GET  /price?ticker=AAPL&weeks=24     → [{ date, close, volume }]   overlay for the ticker drill-down.
-```
-
-Add CORS for `http://localhost:3000`. All responses are JSON; dates are ISO strings.
+No streaming, no token-by-token output. Just a single JSON response.
 
 ### Phase detector
 
-`backend/phase_detector.py`:
+Keep the Gaussian-fit phase detector from the previous version — but only use the simple outputs (`phase`, `label`, `emoji`, `pct_of_peak`, `momentum`). Skip the cycle-fit fields in the UI; they are distracting for a student project.
 
-```python
-import numpy as np
-from scipy.optimize import curve_fit
+---
 
-def _gauss(x, a, mu, sigma): return a * np.exp(-0.5 * ((x - mu) / sigma) ** 2)
+## Frontend — React + Vite
 
-def detect_phase(curve: list[float], current_week: int, window: int = 3) -> dict:
-    c = np.asarray(curve, dtype=float)
-    peak = float(c.max()) or 1e-9
-    rel = float(c[current_week] / peak)
+### Layout
+- **Left sidebar** (fixed, 220 px): app name "FinLens", then four nav links:
+  1. Topic Explorer
+  2. Topic Graph
+  3. Chat
+  4. Tickers
+- **Main area**: only the currently selected view. No secondary panels. No drawers. Just the view.
 
-    lo = max(0, current_week - window)
-    mid = max(0, current_week - 2 * window)
-    momentum = float(c[lo:current_week + 1].mean() - c[mid:lo].mean()) if lo > mid else 0.0
+### Theme
+- Background: `#ffffff`. Card background: `#f9fafb`. Border: `#e5e7eb`.
+- Text: `#111827` primary, `#6b7280` secondary.
+- Accent: `#2563eb` for active nav, buttons, chart line.
+- Sentiment chips: green `#16a34a`, grey `#6b7280`, red `#dc2626`.
+- Font: `Inter, system-ui, sans-serif`. No custom font loading unless trivial.
 
-    if rel < 0.25:                          phase, label, emoji = "dormant", "Dormant", "🌑"
-    elif momentum > 0.05:                   phase, label, emoji = "rising",  "Rising",  "📈"
-    elif momentum < -0.05 and rel > 0.4:    phase, label, emoji = "fading",  "Fading",  "📉"
-    else:                                   phase, label, emoji = "peak",    "Peak",    "🔥"
-
-    # Gaussian fit to the most recent local-max region.
-    cycle = {"peak_week_estimate": None, "sigma": None, "cycle_progress_pct": None}
-    try:
-        peak_idx = int(np.argmax(c[max(0, current_week - 12):current_week + 1])) + max(0, current_week - 12)
-        lo_f, hi_f = max(0, peak_idx - 4), min(len(c), peak_idx + 5)
-        x = np.arange(lo_f, hi_f); y = c[lo_f:hi_f]
-        if len(x) >= 5:
-            (a, mu, sigma), _ = curve_fit(_gauss, x, y, p0=[y.max(), peak_idx, 2.0], maxfev=2000)
-            progress = float((current_week - mu) / max(abs(sigma), 1e-6))
-            cycle = {"peak_week_estimate": float(mu), "sigma": float(abs(sigma)),
-                     "cycle_progress_pct": float(np.clip(progress, -3, 3))}
-    except Exception:
-        pass
-
-    return {"phase": phase, "label": label, "emoji": emoji,
-            "pct_of_peak": rel, "momentum": momentum,
-            "relative_magnitude": rel, "cycle": cycle}
+### Components (one file each, small)
+```
+src/
+  App.jsx                  # router + sidebar
+  pages/
+    TopicExplorer.jsx
+    TopicGraph.jsx
+    Chat.jsx
+    Tickers.jsx
+  components/
+    Card.jsx
+    Sentimentchip.jsx
+    PhaseBadge.jsx
+    LineChart.jsx          # thin wrapper around Recharts
+  api.js                   # fetch helpers (plain fetch, no React Query needed)
 ```
 
----
+React Query is **optional**. For a student project, plain `useEffect + useState + fetch` is fine and easier to read. Do **not** introduce state management libraries.
 
-## Frontend — React + Vite + Recharts
+### Graph view
+Use `react-force-graph-2d`. Node radius proportional to total topic intensity. Edge width proportional to `weight` (= `1 - pvalue`). Click a node → navigate to Topic Explorer for that topic.
 
-### Data layer
-- `@tanstack/react-query` for fetching. **Polling is off by default** (the corpus is static). Enable 60s polling only on `/timeline` + `/phase` when a debug flag is on.
-- Optimistic insert on `POST /topics` (append with a temp id, swap on success).
-- Loading skeletons: shimmer on `#1e293b`.
-
-### New UI feature — Article drill-down
-Clicking a week bar (seasonality) or lifecycle-chart point opens a slide-in right panel with `GET /articles?topic_id=...&iso_week=...&top_n=5`. Show per article: ticker chip, MiniLM cosine or fixed-topic prob (whichever applies), FinBERT sentiment chip, truncated title + snippet, XGBoost `proba_up` badge (green ≥ threshold, red < threshold), external link to `Url`. No full page reload.
-
-### Keep existing look
-IBM Plex Mono + Syne, `#020817` background, dark terminal feel.
+### Chat view
+- Single input box at the top (full width).
+- Below: last response as three stacked cards — **Summary** (paragraph), **Sentiment** (three coloured bars), **Sources** (list of 5 articles).
+- No multi-turn memory. Each query is independent. Keep it simple.
 
 ---
 
-## Feasibility of analyses & plots
-
-Each prototype visualisation is only kept if the corpus genuinely supports it — otherwise drop it.
-
-| Chart | Feasible? | Notes |
-|---|---|---|
-| **Weekly intensity curve (24w)** | ✅ | `prob_<label>` is already per-article; group-by ISO week. |
-| **Phase / momentum badge** | ✅ | Deterministic from the 24-week curve. |
-| **Seasonality heatmap (week-of-year)** | ⚠ conditional | Corpus must span ≥ 2 calendar years for this to be meaningful. Check `subset_news["date_parsed"].min()` / `max()` at startup; if span < 104 weeks, hide the seasonality tab and emit a console warning instead of faking it. |
-| **Per-topic top tickers** | ✅ | Join + group-by. |
-| **Topic × ticker heatmap** | ✅ | Small matrix (13 × N). |
-| **Gaussian cycle-fit overlay** | ⚠ | Needs a clean local max; fall back to reporting `null` for `peak_week_estimate` if `curve_fit` fails (handled in the code above). |
-| **Price overlay on ticker drill-down** | ✅ | Served from `stock_price.parquet`. |
-| **XGBoost conviction weighting** | ✅ | Merge `xgb_tb_predictions.parquet`. |
-| **User-defined topics via MiniLM + cosine** | ✅ | The `POST /topics` flow below: embed the label with MiniLM, score cosine against `article_embeddings.npy`, aggregate weekly. Fully supported — this is the "discover a new topic" UX. |
-| **BERTopic HDBSCAN residuals as separate auto-clusters** | ❌ | Different from user topics. The saved model is zero-shot-locked to the 13 anchors; residuals are small and noisy. If you want corpus-level discovery, spin up a *fresh* BERTopic (no `zeroshot_topic_list`) on the cached embeddings — treat as an offline admin job, not a live endpoint. |
-| **Live FNS-PID stream** | ❌ | No external feed in this repo. Remove from scope. |
-
----
-
-## Environment & tooling
+## Project layout
 
 ```
-Python 3.11+ (conda env in environment.yml)
-fastapi uvicorn[standard]
-polars pyarrow
-sentence-transformers transformers torch
-bertopic umap-learn hdbscan
-scikit-learn xgboost joblib
-sumy nltk  # + python -m nltk.downloader punkt
-scipy numpy pandas
-rapidfuzz  # only if you add alias lookup as a fallback
-
-Node 20+
-React 18, Vite
-@tanstack/react-query recharts
+backend/
+  main.py                  # FastAPI app + CORS + startup hook
+  config.py                # paths, POOL, topic labels
+  loaders.py               # lazy model loaders
+  data_store.py            # parquet + mmap loads at startup
+  services/
+    topics.py              # topic CRUD (SQLite for user topics)
+    timeline.py            # 24-week intensity, fixed + user paths
+    phase_detector.py
+    graph.py               # cointegration adjacency (precomputed)
+    chat.py                # retrieve + summarise
+    tickers.py             # ticker browser aggregates
+  scripts/
+    check_models.py
+    warmup.py              # precompute intensity grid + graph
+frontend/
+  src/ (see above)
+Makefile
+README.md                  # ≤ 5 commands to run
 ```
 
 ### Makefile
 
 ```makefile
-install:        ## install backend + frontend deps
+install:
 	pip install -e .
 	cd frontend && npm install
 
-models:         ## verify all local model artefacts are present
+models:
 	python backend/scripts/check_models.py
 
-warmup:         ## precompute 24w intensity grid + topic×ticker matrix, write to cache/
+warmup:
 	python backend/scripts/warmup.py
 
-dev:            ## run FastAPI on :8000 and Vite on :3000 concurrently
+dev:
 	(cd backend && uvicorn main:app --reload --port 8000) & \
 	(cd frontend && npm run dev)
 ```
 
-Do **not** add a `make models` target that downloads from HuggingFace — all weights already live in [models/](../models/). `make models` just verifies presence.
-
 ---
 
-## Deliverables
+## Environment
 
 ```
-backend/
-  main.py                  # FastAPI app, CORS, lifespan event loads caches
-  config.py                # paths, pool, topic labels/descriptions (single source of truth)
-  loaders.py               # lazy getters for MiniLM / BERTopic / NER / FinBERT / XGB bundles
-  data_store.py            # polars reads of parquet caches, memmap of article_embeddings.npy
-  services/
-    topics.py              # CRUD + MiniLM embedding of user topics (SQLite persistence)
-    timeline.py            # weekly intensity, fixed vs user topic paths
-    phase_detector.py      # (see code above)
-    stocks.py              # per-ticker aggregates joined with xgb predictions
-    articles.py            # drill-down ranking
-    ingest.py              # (optional v2) NER → LSA → zero-shot → FinBERT for new articles
-  scripts/
-    check_models.py
-    warmup.py
-frontend/
-  src/
-    App.jsx                # real API calls, React Query, no mocks
-    hooks/{useTopics,useTimeline,usePhase,useStocks,useArticles}.js
-    components/
-      LifecycleChart.jsx
-      SeasonalityHeatmap.jsx
-      TickerMatrix.jsx
-      ArticlePanel.jsx     # right-hand drill-down
-      SkeletonCard.jsx
-      TopicComposer.jsx    # POST /topics
-Makefile
-README.md                  # startup in ≤ 5 commands
+Python 3.11
+fastapi uvicorn[standard]
+polars pyarrow
+sentence-transformers transformers torch
+scikit-learn xgboost joblib
+sumy nltk                # + python -m nltk.downloader punkt
+statsmodels              # for cointegration
+scipy numpy pandas
+
+Node 20
+React 18, Vite, Recharts, react-force-graph-2d
 ```
 
-`README.md`: clone → `make install` → `make models` → `make warmup` → `make dev`. Document that the corpus is frozen at the latest date in `subset_news` and that "live" applies to user-defined topics only.
+No Tailwind required — plain CSS modules are fine. If the agent prefers Tailwind, use it only with default tokens (no custom palette beyond the theme colors above).
 
 ---
 
-## Constraints & sharp edges
+## Hard constraints
 
-- **Never re-embed the corpus on a request.** `article_embeddings.npy` is ~400 MB; memory-map with `np.load(..., mmap_mode="r")` at startup. Query → dot product → top-k is O(N·D) and runs in < 1 s on CPU for ~1M rows.
-- **User-topic intensity**: normalise cosine similarity to `[0, 1]` with `(sim + 1) / 2` before weekly aggregation so user topics and fixed topics are on a comparable scale in the UI.
-- **Week alignment**: always use `date_parsed.iso_calendar().week` + `.year` as the join key. The year component matters for `seasonality`.
-- **Ticker filtering**: every `/timeline`, `/stocks`, `/matrix` call must restrict to the 63-ticker `POOL`. A one-shot `pool = pl.read_parquet(...)["Stock_symbol"].unique()` at startup is fine.
-- **SQLite for user topics**: `topics.db` with `(id TEXT PK, label TEXT, description TEXT, embedding BLOB, created_at)`. Survives restarts. Fixed topics are not stored — they're hard-coded in `config.py`.
-- **BERTopic lazy-load**: UMAP + HDBSCAN deps are heavy; load on first `/admin/*` hit, not at startup.
-- **No force-retraining anything.** If an artefact appears stale, surface a warning from `/health` and continue serving.
+- **No mock data** in the frontend. Every number comes from the FastAPI backend.
+- **No external API calls.** Everything runs locally.
+- **Don't re-embed the corpus per request.** Memory-map `article_embeddings.npy`.
+- **Restrict every ticker operation to the 63-ticker POOL.**
+- **Cointegration is precomputed once at startup**, cached in `cache/topic_graph.json`.
+- **Keep files short.** No backend file longer than ~200 lines. No React component longer than ~150 lines. If it grows past that, split it.
+- **No feature not listed in the 4 views.** If something is interesting but doesn't fit, leave it out.
 
 ---
 
-## Verification checklist (agent must self-check before declaring done)
+## Verification checklist
 
-- [ ] `/health` returns 200 with every artefact path in `models/` confirmed to exist.
-- [ ] `/timeline?topic_id=big_tech_and_software` returns a 24-point array whose sum matches a polars query run directly against `full_df_topic_probabilities.parquet`.
-- [ ] `POST /topics { "label": "central bank liquidity" }` → `GET /timeline?topic_id=<new>` completes in < 3 s end-to-end.
-- [ ] `/stocks?topic_id=oil_gas_and_energy` puts `XOM` and `CVX` in the top 5.
-- [ ] Drill-down on any bar opens the slide-in panel with 5 real articles (non-empty `Url`, matching `Stock_symbol`).
-- [ ] Bundling the frontend and starting `make dev` gives a working app at `http://localhost:3000` with zero mock data imports remaining.
-
-The key seams to watch: **ingest → cache → serve** (read-only for v1; no mutation of the parquet files at runtime), and the **user-topic live path** (MiniLM encode + matmul + weekly group-by — keep it in-process).
+- [ ] `make dev` launches the app at `http://localhost:3000` against a working backend on `:8000`.
+- [ ] The sidebar has exactly 4 items; each navigates to a single uncluttered page.
+- [ ] Theme is white/light. No dark backgrounds anywhere.
+- [ ] Topic Explorer renders a 24-week intensity chart + phase badge + top 5 tickers for `big_tech_and_software`.
+- [ ] Topic Graph renders a node-link diagram with at least a few edges (cointegration p < 0.05 pairs).
+- [ ] Chat returns a 5-sentence summary, sentiment breakdown, and 5 source articles for the query *"Summarise oil & gas news in the last month"*.
+- [ ] Ticker Browser for `AAPL` shows a 24-week price line + top topics + 5 recent articles.
+- [ ] No frontend file imports mock/fake data.
